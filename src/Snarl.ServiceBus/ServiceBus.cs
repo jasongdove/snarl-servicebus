@@ -1,4 +1,10 @@
-﻿using libSnarlExtn;
+﻿using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using IniParser;
+using Microsoft.ServiceBus;
+using Microsoft.ServiceBus.Messaging;
+using libSnarlExtn;
 using Snarl.V44;
 using System;
 
@@ -15,11 +21,15 @@ namespace SnarlExtensions
         private readonly string _versionDate = DateTime.Parse("2013-01-05").ToLongDateString();
 
         private SnarlInterface _snarl;
+        private CancellationTokenSource _cts;
 
         public int Initialize()
         {
             _snarl = new SnarlInterface();
             _snarl.Register("jasongdove/" + ApplicationName, ApplicationName, Guid.NewGuid().ToString("N"));
+
+            _cts = new CancellationTokenSource();
+
             return (int)SnarlStatus.Success;
         }
 
@@ -33,11 +43,12 @@ namespace SnarlExtensions
 
         public void Start()
         {
-            _snarl.Notify("", "", ApplicationName, "Snarl test");
+            Task.Factory.StartNew(ReceiveMessages, _cts.Token);
         }
 
         public void Stop()
         {
+            _cts.Cancel();
         }
 
         public int GetConfigWindow()
@@ -59,13 +70,72 @@ namespace SnarlExtensions
             info.Path = System.Reflection.Assembly.GetExecutingAssembly().Location;
             info.Release = Release;
             info.Revision = Revision;
-            info.SupportEmail = "jason@jasongdove.com";
-            info.URL = "http://jasongdove.com";
             info.Version = SnarlApiVersion;
+            //info.Flags = SNARL_EXTENSION_FLAGS.SNARL_EXTN_IS_CONFIGURABLE;
         }
 
         public void LastError(ref string description)
         {
+        }
+
+        private void ReceiveMessages()
+        {
+            var app = new libsnarl26.SnarlApp();
+            string configPath = Path.Combine(app.GetEtcPath(), ".servicebus");
+            var parser = new FileIniDataParser();
+            IniData data = parser.LoadFile(configPath);
+            var section = data["servicebus"];
+
+            var builder = new ServiceBusConnectionStringBuilder();
+            builder.Endpoints.Add(new Uri(section["endpoint"]));
+            builder.SharedSecretIssuerName = section["issuer"];
+            builder.SharedSecretIssuerSecret = section["access_key"];
+            string connectionString = builder.ToString();
+            string topic = data["servicebus"]["topic"];
+            string subscription = data["servicebus"]["subscription"];
+            var client = SubscriptionClient.CreateFromConnectionString(connectionString, topic, subscription);
+
+            while (!_cts.IsCancellationRequested)
+            {
+                var message = client.Receive(TimeSpan.FromHours(1));
+                if (message != null)
+                {
+                    try
+                    {
+                        if (message.DeliveryCount > 2)
+                        {
+                            message.DeadLetter();
+                        }
+
+                        string title = message.Properties.ContainsKey("title")
+                            ? message.Properties["title"] as string
+                            : ApplicationName;
+
+                        string image = message.Properties.ContainsKey("image")
+                            ? message.Properties["image"] as string
+                            : null;
+
+                        SnarlMessagePriority priority = message.Properties.ContainsKey("priority")
+                            ? (SnarlMessagePriority)(int)message.Properties["priority"]
+                            : SnarlMessagePriority.Normal;
+
+                        string body;
+                        using (var reader = new StreamReader(message.GetBody<Stream>()))
+                        {
+                            body = reader.ReadToEnd();
+                        }
+
+                        _snarl.Notify(null, null, title, body, null, null, image, null, null, null, priority);
+
+                        message.Complete();
+                    }
+                    catch (Exception ex)
+                    {
+                        _snarl.Notify(null, null, ApplicationName, ex.Message);
+                        message.Abandon();
+                    }
+                }
+            }
         }
     }
 }
